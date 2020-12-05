@@ -131,7 +131,13 @@ github_DESCRIPTION <- function(username, repo, subdir = NULL, ref = "HEAD", host
 github_curl_fetch_memory <- function(url, headers, accept = NULL) {
   h <- curl::new_handle()
   curl::handle_setheaders(h, .list = headers)
-  res <- curl::curl_fetch_memory(url, handle = h)
+
+  repeat {
+    res <- curl::curl_fetch_memory(url, handle = h)
+    if (!github_ratelimit_wait(res)) {
+      break
+    }
+  }
 
   if (!(res$status_code %in% accept)) {
     if (res$status_code >= 300) {
@@ -142,7 +148,11 @@ github_curl_fetch_memory <- function(url, headers, accept = NULL) {
   res
 }
 
-github_error <- function(res) {
+github_ratelimit_wait <- function(res) {
+  if (!identical(as.integer(res$status_code), 403L)) {
+    return(FALSE)
+  }
+
   res_headers <- curl::parse_headers_list(res$headers)
 
   ratelimit_limit <- res_headers$`x-ratelimit-limit` %||% NA_character_
@@ -151,22 +161,59 @@ github_error <- function(res) {
 
   ratelimit_reset <- .POSIXct(res_headers$`x-ratelimit-reset` %||% NA_character_, tz = "UTC")
 
+  if (!identical(as.integer(ratelimit_remaining), 0L)) {
+    return(FALSE)
+  }
+
+  error_details <- json$parse(raw_to_char_utf8(res$content))$message
+
+  guidance <-
+    sprintf(
+      "To increase your GitHub API rate limit
+    - Use `usethis::browse_github_pat()` to create a Personal Access Token.
+    - %s",
+      if (!in_ci()) {
+        "Use `usethis::edit_r_environ()` and add the token as `GITHUB_PAT`."
+      }
+    )
+
+  msg <- sprintf(
+    "HTTP error %s.
+  %s
+
+  %s
+
+  Rate limit remaining: %s/%s
+  Waiting until rate limit reset at: %s
+  ",
+
+    res$status_code,
+    error_details,
+    guidance,
+    ratelimit_remaining,
+    ratelimit_limit,
+    format(ratelimit_reset, usetz = TRUE)
+  )
+
+  message(msg)
+
+  repeat {
+    message(".", appendLF = FALSE)
+    Sys.sleep(10)
+    if (Sys.time() > ratelimit_reset) {
+      break
+    }
+  }
+
+  message("")
+  TRUE
+}
+
+github_error <- function(res) {
   error_details <- json$parse(raw_to_char_utf8(res$content))$message
 
   guidance <- ""
-  if (identical(as.integer(ratelimit_remaining), 0L)) {
-    guidance <-
-      sprintf(
-"To increase your GitHub API rate limit
-  - Use `usethis::browse_github_pat()` to create a Personal Access Token.
-  - %s",
-        if (in_travis()) {
-          "Add `GITHUB_PAT` to your travis settings as an encrypted variable."
-        } else {
-          "Use `usethis::edit_r_environ()` and add the token as `GITHUB_PAT`."
-        }
-      )
-  } else if (identical(as.integer(res$status_code), 404L)) {
+  if (identical(as.integer(res$status_code), 404L)) {
     repo_information <- re_match(res$url, "(repos)/(?P<owner>[^/]+)/(?P<repo>[^/]++)/")
     if(!is.na(repo_information$owner) && !is.na(repo_information$repo)) {
       guidance <- sprintf(
@@ -191,23 +238,6 @@ github_error <- function(res) {
      error_details,
      guidance
    )
- } else if (!is.na(ratelimit_limit)) {
-  msg <- sprintf(
-"HTTP error %s.
-  %s
-
-  Rate limit remaining: %s/%s
-  Rate limit reset at: %s
-
-  %s",
-
-    res$status_code,
-    error_details,
-    ratelimit_remaining,
-    ratelimit_limit,
-    format(ratelimit_reset, usetz = TRUE),
-    guidance
-  )
  } else {
    msg <- sprintf(
      "HTTP error %s.
